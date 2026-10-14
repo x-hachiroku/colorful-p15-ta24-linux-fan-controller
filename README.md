@@ -1,8 +1,8 @@
 # Linux fan control for Colorful P15 TA24
 
-This utility requests **automatic cooling** or **maximum cooling** using the same firmware messages as the Windows CC30 fan app. It targets COLORFUL P15 TA 24 with BIOS `1.07.05COLO1`. The driver refuses other laptop/BIOS identities.
+This utility requests **automatic cooling**, **maximum cooling**, or **fixed fan duty (25–100%)** using the same firmware messages as the Windows CC30 fan app. It targets COLORFUL P15 TA 24 with BIOS `1.07.05COLO1`. The driver refuses other laptop/BIOS identities.
 
-Hardware operation has been confirmed by the laptop owner on kernel `7.2.9-zen1-1-zen`. The module builds cleanly, and the CLI lifecycle tests pass.
+Automatic and maximum mode hardware operation has been confirmed by the laptop owner on kernel `7.2.9-zen1-1-zen`. The module builds cleanly, and the CLI lifecycle tests pass.
 
 ## Quick start
 
@@ -27,15 +27,48 @@ Loading the module only checks laptop identity, ACPI device/path, and existence 
 
 This describes the message and performs no hardware writes. `status` reads existing sensors and driver attributes without firmware control calls.
 
+## Fixed percentages and holding control
+
+Set all fans to a fixed duty percentage for 30 seconds:
+
+```sh
+sudo ./cc30-fan fixed 50
+```
+
+Keep a setting active until Ctrl-C:
+
+```sh
+sudo ./cc30-fan fixed 50 --hold
+sudo ./cc30-fan max --hold
+```
+
+Use `--seconds 120` for a timed session instead. `--seconds` and `--hold` are mutually exclusive; both modes default to 30 seconds. Ctrl-C restores automatic cooling.
+
+Fixed percentages represent PWM duty, not a percentage of maximum RPM. The value is applied to all three Clevo fan slots and converted to the firmware's 0–255 scale. The supported range is 25–100%, using Clevo's minimum running duty to avoid stalled fans.
+
+Fixed mode requires CPU temperature sensors and `/usr/bin/nvidia-smi` for GPU temperature monitoring. It checks temperatures and renews a five-second kernel lease every second. If the CPU or GPU reaches 85°C, or readings become unavailable or invalid, the session ends and restores automatic cooling. `--hold` retains these checks and the lease. Maximum mode continues to use its 60-second lease, renewed every 20 seconds.
+
+After updating the driver, reload it before using fixed mode:
+
+```sh
+make W=1
+sudo rmmod cc30_fan
+sudo insmod ./cc30_fan.ko
+sudo ./cc30-fan fixed 50 --hold
+```
+
+Stop any existing control session before unloading the driver.
+
 ## Recovery and boundaries
 
 The module also requests auto on suspend, shutdown, removal, and lease expiry if it has previously issued a command. Failed automatic evaluations retry every five seconds while the module is running; a failed restore blocks suspend. Restoration errors during removal or shutdown are logged. Driver `mode` is the **last requested mode**, initially `unknown`; `last_error` reports the result of the ACPI evaluation. Use `status` to view fan RPM.
 
-Only `auto` and `max` are exposed. This version does not provide arbitrary fixed RPM/percentages, silent mode, firmware curve changes, EC register access, or persistent installation. Existing firmware thermal management supplies automatic mode.
+The controls are `auto`, `max`, and `fixed PERCENT`. Existing firmware thermal management supplies automatic mode. Fixed RPM targets, silent mode, custom firmware curves, and persistent installation are outside this utility's scope.
 
 The module binds the existing `CLV0001:00` platform device at `\_SB_.DCHU`. Its attributes are:
 
-- `/sys/bus/platform/devices/CLV0001:00/mode`: readable by everyone; writable by root; accepts exactly `auto` or `max`.
+- `/sys/bus/platform/devices/CLV0001:00/mode`: readable by everyone; writable by root; accepts `auto` or `max`; reads show `unknown`, `auto`, `max`, or `fixed`.
+- `/sys/bus/platform/devices/CLV0001:00/percent`: readable by everyone; writable by root; accepts integers 25–100 and enters fixed mode with a five-second lease. The displayed value is the last requested percentage.
 - `lease_seconds_remaining`: time before automatic restoration is due.
 - `last_error`: zero after a returned ACPI object, or negative errno after evaluation failure.
 
@@ -73,7 +106,7 @@ make W=1
 python3 -m unittest discover -s . -p 'test_*.py'
 ```
 
-The tests cover timeout/renewal, interruption, ambiguous write failure, and restoration failure without touching hardware. Hardware operation was subsequently confirmed by the laptop owner.
+The tests cover timed and held sessions, fixed-duty renewal, thermal failure recovery, input validation, interruption, ambiguous write failure, and restoration failure without touching hardware. Automatic and maximum mode operation was confirmed by the laptop owner.
 
 See [the reverse engineering report](./FAN_CONTROL.md) for byte-level messages, source addresses, hashes, and limitations. The driver source is GPL-2.0-only. Neither the Windows executable nor its drivers are executed by this Linux utility.
 

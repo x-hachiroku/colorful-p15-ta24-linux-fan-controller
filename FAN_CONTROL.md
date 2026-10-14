@@ -69,3 +69,9 @@ REA is not connected as MCP in this session. An existing cached REA 6.5.0 CLI su
 | Service identity | `rea-service.json`: `ev_9b54be3e76fae246cb5f6fce4697742b796bade263de7d7658cc5d78ad8f3bc8` |
 
 The fan-command construction is answered by static evidence; Linux compatibility and live telemetry are observed read-only; the supplied utility is built and tested offline. Physical fan response, firmware command return semantics, actual EC implementation, and behavior of arbitrary percentages/custom curves remain unverified. A returned ACPI object establishes evaluation completion only.
+
+## Fixed-duty extension
+
+The service CIL maps decimal 104 (`0x68`) to `SetFanDuty` and decimal 105 (`0x69`) to `SetFanAutoDuty`. Installed `/usr/src/tuxedo-drivers-4.24.0/clevo_interfaces.h` and `tuxedo_io/tuxedo_io.c` corroborate three packed 8-bit duty values, a 0–255 duty scale, and a 25% minimum running duty. `clevo_acpi.c` supplies integer commands through revision 0 `_DSM` with a one-integer package. The new `percent` attribute follows this integer ABI, while mode `0x79` retains the recovered buffer ABI.
+
+The extension applies equal duty to all three fan slots with `round(percent*255/100)` (ties round up). On entry it restores firmware auto, then issues function `0x68`. On exit it clears the manual-duty latch through function `0x69` argument 0 and restores function `0x79` automatic mode. The fixed lease is five seconds, renewed every second by the CLI. CPU/GPU readings are required and a reading at 85°C or sensor failure ends the session. `--hold` keeps renewing until interruption. These new operations were built and tested offline; the user's hardware confirmation applies to the earlier auto/max commands.

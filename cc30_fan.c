@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Focused CC30 auto/max fan-mode bridge. No EC access or probe writes. */
+/* Focused CC30 fan-mode and fixed-duty bridge. No EC access or probe writes. */
 #include <linux/acpi.h>
 #include <linux/dmi.h>
 #include <linux/jiffies.h>
@@ -13,6 +13,7 @@
 
 #define CC30_LEASE_SECONDS 60
 #define CC30_RETRY_SECONDS 5
+#define CC30_FIXED_LEASE_SECONDS 5
 
 static const guid_t cc30_dsm_guid =
 	GUID_INIT(0x93f224e4, 0xfbdc, 0x4bbf, 0xad, 0xd6, 0xdb, 0x71, 0xbd, 0xc0, 0xaf, 0xad);
@@ -26,33 +27,55 @@ struct cc30_fan {
 	int last_error;
 	const char *requested;
 	bool touched;
+	bool fixed_touched;
+	unsigned int percent;
 	bool needs_auto;
 	bool suspended;
 	bool stopping;
 };
 
-/* Windows SetDCHU_Data: revision 0, function 0x79, package(buffer[256]).
- * A returned object proves evaluation completed, not that firmware acted.
- */
-static int cc30_submit_locked(struct cc30_fan *fan, bool max)
+/* Mode uses the Windows buffer ABI; fixed duty uses Clevo's integer ABI. */
+static int cc30_evaluate_locked(struct cc30_fan *fan, u8 command, u32 value,
+			       bool integer)
 {
 	u8 payload[256] = { 0 };
-	union acpi_object buffer = {
+	union acpi_object argument = {
 		.buffer = { .type = ACPI_TYPE_BUFFER, .length = sizeof(payload),
 			    .pointer = payload },
 	};
 	union acpi_object package = {
 		.package = { .type = ACPI_TYPE_PACKAGE, .count = 1,
-			     .elements = &buffer },
+			     .elements = &argument },
 	};
 	union acpi_object *result;
 
-	put_unaligned_le32(max ? 0x01000001 : 0x01000000, payload);
+	if (integer) {
+		argument.integer.type = ACPI_TYPE_INTEGER;
+		argument.integer.value = value;
+	} else {
+		put_unaligned_le32(value, payload);
+	}
 	fan->touched = true;
-	fan->requested = max ? "max" : "auto";
-	result = acpi_evaluate_dsm(fan->handle, &cc30_dsm_guid, 0, 0x79, &package);
+	result = acpi_evaluate_dsm(fan->handle, &cc30_dsm_guid, 0, command, &package);
 	fan->last_error = result ? 0 : -EIO;
 	ACPI_FREE(result);
+	return fan->last_error;
+}
+
+static int cc30_submit_locked(struct cc30_fan *fan, bool max)
+{
+	int error = 0, mode_error;
+
+	/* Reset the manual-duty latch before changing the firmware mode. */
+	if (fan->fixed_touched) {
+		error = cc30_evaluate_locked(fan, 0x69, 0, true);
+		if (!error)
+			fan->fixed_touched = false;
+	}
+	fan->requested = max ? "max" : "auto";
+	mode_error = cc30_evaluate_locked(fan, 0x79,
+					 max ? 0x01000001 : 0x01000000, false);
+	fan->last_error = error ? error : mode_error;
 	return fan->last_error;
 }
 
@@ -133,6 +156,52 @@ static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR(mode, 0644, mode_show, mode_store);
 
+static ssize_t percent_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct cc30_fan *fan = dev_get_drvdata(dev);
+	unsigned int percent;
+
+	mutex_lock(&fan->lock);
+	percent = fan->percent;
+	mutex_unlock(&fan->lock);
+	return sysfs_emit(buf, "%u\n", percent);
+}
+
+static ssize_t percent_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct cc30_fan *fan = dev_get_drvdata(dev);
+	unsigned int percent, duty;
+	int error;
+
+	if (kstrtouint(buf, 10, &percent) || percent < 25 || percent > 100)
+		return -EINVAL;
+	duty = DIV_ROUND_CLOSEST(percent * 255, 100);
+	mutex_lock(&fan->lock);
+	if (fan->suspended || fan->stopping) {
+		mutex_unlock(&fan->lock);
+		return -EBUSY;
+	}
+	/* Start from firmware auto when entering fixed mode. Renewals stay fixed. */
+	error = 0;
+	if (strcmp(fan->requested, "fixed"))
+		error = cc30_submit_locked(fan, false);
+	if (!error) {
+		fan->fixed_touched = true;
+		fan->requested = "fixed";
+		fan->percent = percent;
+		/* Same duty in each of Clevo's three fan slots. */
+		error = cc30_evaluate_locked(fan, 0x68, duty * 0x010101, true);
+	}
+	fan->needs_auto = true;
+	fan->deadline = error ? jiffies : jiffies + CC30_FIXED_LEASE_SECONDS * HZ;
+	mod_delayed_work(system_wq, &fan->restore_work,
+			 error ? HZ : CC30_FIXED_LEASE_SECONDS * HZ);
+	mutex_unlock(&fan->lock);
+	return error ? error : count;
+}
+static DEVICE_ATTR(percent, 0644, percent_show, percent_store);
+
 static ssize_t lease_seconds_remaining_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -161,6 +230,7 @@ static DEVICE_ATTR_RO(last_error);
 
 static struct attribute *cc30_attrs[] = {
 	&dev_attr_mode.attr,
+	&dev_attr_percent.attr,
 	&dev_attr_lease_seconds_remaining.attr,
 	&dev_attr_last_error.attr,
 	NULL,
@@ -279,6 +349,6 @@ static struct platform_driver cc30_driver = {
 };
 module_platform_driver(cc30_driver);
 
-MODULE_DESCRIPTION("COLORFUL P15 TA 24 CC30 automatic/maximum fan-mode bridge");
+MODULE_DESCRIPTION("COLORFUL P15 TA 24 CC30 automatic/maximum/fixed fan bridge");
 MODULE_AUTHOR("CC30 Linux investigation");
 MODULE_LICENSE("GPL");

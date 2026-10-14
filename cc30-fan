@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -27,7 +28,8 @@ def status():
               'driver_loaded': (DEVICE / 'mode').exists(),
               'last_requested_mode': read(DEVICE / 'mode'),
               'lease_seconds_remaining': read(DEVICE / 'lease_seconds_remaining'),
-              'last_error': read(DEVICE / 'last_error'), 'fans': [], 'temperatures': []}
+              'last_error': read(DEVICE / 'last_error'),
+              'last_requested_percent': read(DEVICE / 'percent'), 'fans': [], 'temperatures': []}
     for hwmon in sorted(Path('/sys/class/hwmon').glob('hwmon*')):
         name = read(hwmon / 'name')
         for path in sorted(hwmon.glob('fan*_input')):
@@ -52,17 +54,63 @@ def write_mode(mode, device=DEVICE):
         stream.write(mode + '\n')
 
 
-def max_session(seconds, write=write_mode, clock=time.monotonic, wait=STOP.wait):
-    """Renew the 60-second kernel lease; request auto on every exit path."""
-    deadline = clock() + seconds
+def write_percent(percent, device=DEVICE):
+    with (device / 'percent').open('w') as stream:
+        stream.write(str(percent) + '\n')
+
+
+def check_temperatures():
+    cpu = []
+    for hwmon in Path('/sys/class/hwmon').glob('hwmon*'):
+        if read(hwmon / 'name') not in ('coretemp', 'k10temp'):
+            continue
+        for sensor in hwmon.glob('temp*_input'):
+            value = read(sensor)
+            if value is None:
+                raise OSError('CPU temperature reading lost; restoring auto')
+            try:
+                cpu.append(int(value) / 1000)
+            except ValueError as error:
+                raise OSError('Invalid CPU temperature; restoring auto') from error
+    if not cpu:
+        raise OSError('CPU temperature unavailable; restoring auto')
+    # This laptop has an NVIDIA GPU. Require its temperature as well as CPU data.
     try:
-        while clock() < deadline and not STOP.is_set():
-            write('max')
-            if wait(min(20, max(0, deadline - clock()))):
+        result = subprocess.run(['/usr/bin/nvidia-smi', '--query-gpu=temperature.gpu',
+                                 '--format=csv,noheader,nounits'],
+                                capture_output=True, text=True, timeout=2, check=True)
+        gpu = [float(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise OSError('GPU temperature unavailable; restoring auto') from error
+    if not gpu or any(not -10 <= value <= 125 for value in cpu + gpu):
+        raise OSError('Invalid temperature readings; restoring auto')
+    if max(cpu + gpu) >= 85:
+        raise OSError('CPU or GPU reached 85°C; restoring auto')
+
+
+def control_session(mode, seconds, percent=None, write=write_mode,
+                    clock=time.monotonic, wait=STOP.wait, check=check_temperatures,
+                    set_percent=write_percent):
+    """Renew a kernel lease until timeout or interruption; always request auto."""
+    deadline = None if seconds is None else clock() + seconds
+    interval = 1 if mode == 'fixed' else 20
+    try:
+        while not STOP.is_set() and (deadline is None or clock() < deadline):
+            if mode == 'fixed':
+                check()
+                set_percent(percent)
+            else:
+                write(mode)
+            delay = interval if deadline is None else min(interval, max(0, deadline - clock()))
+            if wait(delay):
                 break
     finally:
-        # Also restore after an ambiguous failure: firmware may have received max.
+        # A failed evaluation may still have changed hardware.
         write('auto')
+
+
+def max_session(seconds, write=write_mode, clock=time.monotonic, wait=STOP.wait):
+    control_session('max', seconds, write=write, clock=clock, wait=wait)
 
 
 def stop_handler(signum, frame):
@@ -74,26 +122,45 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('status', help='Read laptop identity, fan RPM, and driver state')
     sub.add_parser('auto', help='Request the firmware automatic fan mode')
-    maximum = sub.add_parser('max', help='Maximum cooling for a bounded interval; returns to auto')
-    maximum.add_argument('--seconds', type=int, default=30, help='Duration 1–3600 seconds (default 30)')
+    maximum = sub.add_parser('max', help='Maximum cooling; returns to auto on exit')
+    fixed = sub.add_parser('fixed', help='Fixed duty on all fans with temperature monitoring')
+    fixed.add_argument('percent', type=int, help='Fan duty percentage, 25–100')
+    for command in (maximum, fixed):
+        duration = command.add_mutually_exclusive_group()
+        duration.add_argument('--seconds', type=int, help='Duration 1–3600 seconds (default 30)')
+        duration.add_argument('--hold', action='store_true', help='Keep control until Ctrl-C')
     parser.add_argument('--dry-run', action='store_true', help='Describe a request without hardware access')
     args = parser.parse_args()
     if args.command == 'status':
         print(json.dumps(status(), indent=2))
         return 0
-    if args.command == 'max' and not 1 <= args.seconds <= 3600:
-        parser.error('--seconds must be between 1 and 3600')
+    seconds = None
+    if args.command in ('max', 'fixed'):
+        seconds = None if args.hold else (30 if args.seconds is None else args.seconds)
+        if seconds is not None and not 1 <= seconds <= 3600:
+            parser.error('--seconds must be between 1 and 3600')
+    if args.command == 'fixed' and not 25 <= args.percent <= 100:
+        parser.error('percent must be between 25 and 100 (minimum running duty)')
     payload = '0x01000000' if args.command == 'auto' else '0x01000001'
     if args.dry_run:
-        print(f'_DSM UUID 93f224e4-fbdc-4bbf-add6-db71bdc0afad, revision 0, function 0x79; '
-              f'package of one 256-byte buffer, first uint32 LE {payload}, remainder zero.')
-        if args.command == 'max':
-            print(f'Renew every 20 seconds for {args.seconds} seconds, then request automatic mode.')
+        if args.command == 'fixed':
+            duty = (args.percent * 255 + 50) // 100
+            print(f'_DSM function 0x68, package of one integer 0x{duty * 0x010101:08x}; '
+                  f'all fans at {args.percent}% duty. Auto restores function 0x69 then mode 0x79.')
+        else:
+            print(f'_DSM UUID 93f224e4-fbdc-4bbf-add6-db71bdc0afad, revision 0, function 0x79; '
+                  f'package of one 256-byte buffer, first uint32 LE {payload}, remainder zero.')
+        if args.command != 'auto':
+            duration = 'until Ctrl-C' if seconds is None else f'for {seconds} seconds'
+            print(f'Renew every {1 if args.command == "fixed" else 20} seconds {duration}, '
+                  'then request automatic mode.')
         return 0
     if os.geteuid() != 0:
         parser.error('Fan writes require root. Read-only status and --dry-run do not.')
     if not (DEVICE / 'mode').exists():
         parser.error('cc30_fan driver is not bound. Build and load it as described in README.md.')
+    if args.command == 'fixed' and not (DEVICE / 'percent').exists():
+        parser.error('Reload the rebuilt driver to enable fixed percentages.')
     with open('/run/lock/cc30-fan.lock', 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -105,8 +172,10 @@ def main():
             write_mode('auto')
             print('Automatic mode request submitted. Use status to check fan RPM.')
         else:
-            print(f'Maximum cooling for {args.seconds} seconds; Ctrl-C requests auto.', flush=True)
-            max_session(args.seconds)
+            duration = 'until Ctrl-C' if seconds is None else f'for {seconds} seconds'
+            setting = 'Maximum cooling' if args.command == 'max' else f'Fixed {args.percent}% duty'
+            print(f'{setting} {duration}; Ctrl-C requests auto.', flush=True)
+            control_session(args.command, seconds, percent=getattr(args, 'percent', None))
             print('Automatic mode request submitted.')
     return 0
 
@@ -115,5 +184,5 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except OSError as error:
-        print(f'cc30-fan: {error}. The kernel lease also attempts auto after 60 seconds.', file=sys.stderr)
+        print(f'cc30-fan: {error}. The kernel lease also attempts automatic restoration.', file=sys.stderr)
         sys.exit(1)
