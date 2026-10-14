@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Fan controls for COLORFUL P15 TA 24; see README.md for firmware evidence."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import threading
+import time
+
+DEVICE = Path('/sys/bus/platform/devices/CLV0001:00')
+STOP = threading.Event()
+
+
+def read(path):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def status():
+    result = {'laptop': {key: read(Path('/sys/class/dmi/id') / key)
+                         for key in ('sys_vendor', 'product_name', 'bios_version')},
+              'driver_loaded': (DEVICE / 'mode').exists(),
+              'last_requested_mode': read(DEVICE / 'mode'),
+              'lease_seconds_remaining': read(DEVICE / 'lease_seconds_remaining'),
+              'last_error': read(DEVICE / 'last_error'), 'fans': [], 'temperatures': []}
+    for hwmon in sorted(Path('/sys/class/hwmon').glob('hwmon*')):
+        name = read(hwmon / 'name')
+        for path in sorted(hwmon.glob('fan*_input')):
+            label = (read(path.with_name(path.name.replace('_input', '_label')))
+                     or read(hwmon / 'device/firmware_node/description'))
+            result['fans'].append({'sensor': name, 'label': label,
+                                   'rpm': read(path), 'path': str(path)})
+        for path in sorted(hwmon.glob('temp*_input')):
+            raw = read(path)
+            if raw is not None:
+                try:
+                    value = int(raw) / 1000
+                except ValueError:
+                    continue
+                result['temperatures'].append({'sensor': name, 'celsius': value,
+                                               'label': read(path.with_name(path.name.replace('_input', '_label')))})
+    return result
+
+
+def write_mode(mode, device=DEVICE):
+    with (device / 'mode').open('w') as stream:
+        stream.write(mode + '\n')
+
+
+def max_session(seconds, write=write_mode, clock=time.monotonic, wait=STOP.wait):
+    """Renew the 60-second kernel lease; request auto on every exit path."""
+    deadline = clock() + seconds
+    try:
+        while clock() < deadline and not STOP.is_set():
+            write('max')
+            if wait(min(20, max(0, deadline - clock()))):
+                break
+    finally:
+        # Also restore after an ambiguous failure: firmware may have received max.
+        write('auto')
+
+
+def stop_handler(signum, frame):
+    STOP.set()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('status', help='Read laptop identity, fan RPM, and driver state')
+    sub.add_parser('auto', help='Request the firmware automatic fan mode')
+    maximum = sub.add_parser('max', help='Maximum cooling for a bounded interval; returns to auto')
+    maximum.add_argument('--seconds', type=int, default=30, help='Duration 1–3600 seconds (default 30)')
+    parser.add_argument('--dry-run', action='store_true', help='Describe a request without hardware access')
+    args = parser.parse_args()
+    if args.command == 'status':
+        print(json.dumps(status(), indent=2))
+        return 0
+    if args.command == 'max' and not 1 <= args.seconds <= 3600:
+        parser.error('--seconds must be between 1 and 3600')
+    payload = '0x01000000' if args.command == 'auto' else '0x01000001'
+    if args.dry_run:
+        print(f'_DSM UUID 93f224e4-fbdc-4bbf-add6-db71bdc0afad, revision 0, function 0x79; '
+              f'package of one 256-byte buffer, first uint32 LE {payload}, remainder zero.')
+        if args.command == 'max':
+            print(f'Renew every 20 seconds for {args.seconds} seconds, then request automatic mode.')
+        return 0
+    if os.geteuid() != 0:
+        parser.error('Fan writes require root. Read-only status and --dry-run do not.')
+    if not (DEVICE / 'mode').exists():
+        parser.error('cc30_fan driver is not bound. Build and load it as described in README.md.')
+    with open('/run/lock/cc30-fan.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            parser.error('Another cc30-fan command is running; stop it with Ctrl-C first.')
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, stop_handler)
+        if args.command == 'auto':
+            write_mode('auto')
+            print('Automatic mode request submitted. Use status to check fan RPM.')
+        else:
+            print(f'Maximum cooling for {args.seconds} seconds; Ctrl-C requests auto.', flush=True)
+            max_session(args.seconds)
+            print('Automatic mode request submitted.')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except OSError as error:
+        print(f'cc30-fan: {error}. The kernel lease also attempts auto after 60 seconds.', file=sys.stderr)
+        sys.exit(1)
